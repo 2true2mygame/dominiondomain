@@ -1,0 +1,286 @@
+import asyncio
+import hashlib
+import json
+import os
+import time
+from typing import Dict, List, Tuple
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from kademlia.network import Server  # Requires `pip install kademlia`
+import socket
+import threading
+
+# Blockchain Block
+class Block:
+    def __init__(self, index: int, transactions: List[Dict], previous_hash: str, timestamp: float = None):
+        self.index = index
+        self.transactions = transactions
+        self.previous_hash = previous_hash
+        self.timestamp = timestamp or time.time()
+        self.nonce = 0
+        self.hash = self.compute_hash()
+
+    def compute_hash(self) -> str:
+        block_string = json.dumps({
+            "index": self.index,
+            "transactions": self.transactions,
+            "previous_hash": self.previous_hash,
+            "timestamp": self.timestamp,
+            "nonce": self.nonce
+        }, sort_keys=True)
+        return hashlib.sha256(block_string.encode()).hexdigest()
+
+    def mine(self, difficulty: int = 4):
+        target = "0" * difficulty
+        while self.hash[:difficulty] != target:
+            self.nonce += 1
+            self.hash = self.compute_hash()
+
+# Blockchain
+class DomainDominionBlockchain:
+    def __init__(self):
+        self.chain: List[Block] = [self.create_genesis_block()]
+        self.difficulty = 4
+        self.pending_transactions: List[Dict] = []
+
+    def create_genesis_block(self) -> Block:
+        return Block(0, [], "0")
+
+    def get_latest_block(self) -> Block:
+        return self.chain[-1]
+
+    def add_transaction(self, transaction: Dict):
+        self.pending_transactions.append(transaction)
+
+    def mine_pending_transactions(self, miner_address: str):
+        block = Block(len(self.chain), self.pending_transactions, self.get_latest_block().hash)
+        block.mine(self.difficulty)
+        self.chain.append(block)
+        self.pending_transactions = [
+            {"type": "reward", "to": miner_address, "amount": 10, "data": {}}
+        ]  # Simplified miner reward
+
+    def verify_chain(self) -> bool:
+        for i in range(1, len(self.chain)):
+            if self.chain[i].hash != self.chain[i].compute_hash():
+                return False
+            if self.chain[i].previous_hash != self.chain[i-1].hash:
+                return False
+        return True
+
+# Storage Node
+class StorageNode:
+    def __init__(self, host: str, port: int, storage_dir: str = "storage", kademlia_port: int = None):
+        self.host = host
+        self.port = port
+        self.storage_dir = storage_dir
+        self.key = Fernet.generate_key()
+        self.cipher = Fernet(self.key)
+        os.makedirs(storage_dir, exist_ok=True)
+        self.blockchain = DomainDominionBlockchain()
+        # Kademlia DHT
+        self.kademlia = Server()
+        self.kademlia_port = kademlia_port or port + 1000
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind((host, port))
+        self.server.listen(5)
+        # Generate ECDSA key for blockchain transactions
+        self.private_key = ec.generate_private_key(ec.SECP256K1())
+        self.public_key = self.private_key.public_key()
+        self.address = hashlib.sha256(
+            self.public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKey
+            )
+        ).hexdigest()
+        print(f"Node running at {host}:{port}, Kademlia at {self.kademlia_port}")
+
+    async def start_kademlia(self):
+        await self.kademlia.listen(self.kademlia_port)
+        # Bootstrap to a known node (for demo, assume one exists)
+        await self.kademlia.bootstrap([("localhost", 6001)])
+
+    def store_chunk(self, chunk: bytes, chunk_hash: str) -> bool:
+        try:
+            encrypted_chunk = self.cipher.encrypt(chunk)
+            chunk_path = os.path.join(self.storage_dir, chunk_hash)
+            with open(chunk_path, "wb") as f:
+                f.write(encrypted_chunk)
+            # Store in Kademlia DHT
+            asyncio.run(self.kademlia.set(chunk_hash, f"{self.host}:{self.port}"))
+            # Record storage on blockchain
+            self.blockchain.add_transaction({
+                "type": "store",
+                "chunk_hash": chunk_hash,
+                "node_address": self.address,
+                "data": {}
+            })
+            print(f"Stored chunk {chunk_hash} at {self.host}:{self.port}")
+            return True
+        except Exception as e:
+            print(f"Error storing chunk {chunk_hash}: {e}")
+            return False
+
+    def retrieve_chunk(self, chunk_hash: str) -> bytes:
+        chunk_path = os.path.join(self.storage_dir, chunk_hash)
+        if os.path.exists(chunk_path):
+            with open(chunk_path, "rb") as f:
+                encrypted_chunk = f.read()
+            return self.cipher.decrypt(encrypted_chunk)
+        raise FileNotFoundError(f"Chunk {chunk_hash} not found")
+
+    def handle_client(self, conn: socket.socket, addr: Tuple[str, int]):
+        try:
+            data = conn.recv(4096).decode()
+            request = json.loads(data)
+            if request["type"] == "store":
+                chunk = bytes.fromhex(request["chunk"])
+                chunk_hash = request["chunk_hash"]
+                success = self.store_chunk(chunk, chunk_hash)
+                conn.send(json.dumps({"status": "success" if success else "failure"}).encode())
+            elif request["type"] == "retrieve":
+                chunk_hash = request["chunk_hash"]
+                chunk = self.retrieve_chunk(chunk_hash)
+                conn.send(chunk)
+            elif request["type"] == "register_domain":
+                domain = request["domain"]
+                owner = request["owner"]
+                self.blockchain.add_transaction({
+                    "type": "domain",
+                    "domain": domain,
+                    "owner": owner,
+                    "data": {}
+                })
+                self.blockchain.mine_pending_transactions(self.address)
+                conn.send(json.dumps({"status": "domain_registered"}).encode())
+        except Exception as e:
+            conn.send(json.dumps({"status": "error", "message": str(e)}).encode())
+        finally:
+            conn.close()
+
+    def start(self):
+        asyncio.run(self.start_kademlia())
+        while True:
+            conn, addr = self.server.accept()
+            threading.Thread(target=self.handle_client, args=(conn, addr)).start()
+
+# Client
+class StorageClient:
+    def __init__(self, chunk_size: int = 1024):
+        self.chunk_size = chunk_size
+        self.cipher = Fernet(Fernet.generate_key())
+        self.kademlia = Server()
+        self.kademlia_port = 7001
+        self.private_key = ec.generate_private_key(ec.SECP256K1())
+        self.public_key = self.private_key.public_key()
+        self.address = hashlib.sha256(
+            self.public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKey
+            )
+        ).hexdigest()
+
+    async def start_kademlia(self):
+        await self.kademlia.listen(self.kademlia_port)
+        await self.kademlia.bootstrap([("localhost", 6001)])
+
+    def split_file(self, file_path: str) -> List[Tuple[bytes, str]]:
+        chunks = []
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(self.chunk_size)
+                if not chunk:
+                    break
+                chunk_hash = hashlib.sha256(chunk).hexdigest()
+                chunks.append((chunk, chunk_hash))
+        return chunks
+
+    async def upload_website(self, file_path: str, domain: str) -> List[str]:
+        await self.start_kademlia()
+        chunks = self.split_file(file_path)
+        chunk_hashes = []
+        for chunk, chunk_hash in chunks:
+            encrypted_chunk = self.cipher.encrypt(chunk)
+            # Find nodes via Kademlia
+            node_addr = await self.kademlia.get(chunk_hash)
+            if not node_addr:
+                # Bootstrap to known nodes
+                nodes = [("localhost", 5001), ("localhost", 5002)]
+            else:
+                host, port = node_addr.split(":")
+                nodes = [(host, int(port))]
+            for node_host, node_port in nodes:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((node_host, node_port))
+                    request = {
+                        "type": "store",
+                        "chunk": encrypted_chunk.hex(),
+                        "chunk_hash": chunk_hash
+                    }
+                    sock.send(json.dumps(request).encode())
+                    response = json.loads(sock.recv(4096).decode())
+                    if response["status"] == "success":
+                        chunk_hashes.append(chunk_hash)
+                    sock.close()
+                except Exception as e:
+                    print(f"Failed to upload chunk {chunk_hash} to {node_host}:{node_port}: {e}")
+        # Register domain on blockchain
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("localhost", 5001))  # Connect to a known node
+            request = {
+                "type": "register_domain",
+                "domain": domain,
+                "owner": self.address,
+                "data": {"chunk_hashes": chunk_hashes}
+            }
+            sock.send(json.dumps(request).encode())
+            response = json.loads(sock.recv(4096).decode())
+            print(f"Domain {domain} registered: {response}")
+            sock.close()
+        except Exception as e:
+            print(f"Failed to register domain {domain}: {e}")
+        return chunk_hashes
+
+    async def retrieve_website(self, domain: str, output_path: str):
+        await self.start_kademlia()
+        # Query blockchain for domain metadata (simplified: assume known chunk hashes)
+        chunk_hashes = []  # In production, query blockchain
+        with open(output_path, "wb") as f:
+            for chunk_hash in chunk_hashes:
+                node_addr = await self.kademlia.get(chunk_hash)
+                if not node_addr:
+                    continue
+                host, port = node_addr.split(":")
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((host, int(port)))
+                    request = {"type": "retrieve", "chunk_hash": chunk_hash}
+                    sock.send(json.dumps(request).encode())
+                    chunk = sock.recv(4096)
+                    decrypted_chunk = self.cipher.decrypt(chunk)
+                    f.write(decrypted_chunk)
+                    sock.close()
+                except Exception as e:
+                    print(f"Failed to retrieve chunk {chunk_hash} from {host}:{port}: {e}")
+
+# Example usage
+async def main():
+    # Start two storage nodes
+    node1 = StorageNode("localhost", 5001, "storage1", 6001)
+    node2 = StorageNode("localhost", 5002, "storage2", 6002)
+    threading.Thread(target=node1.start, daemon=True).start()
+    threading.Thread(target=node2.start, daemon=True).start()
+    await asyncio.sleep(1)  # Wait for nodes to start
+
+    # Create a client and upload a website
+    client = StorageClient()
+    with open("website.html", "w") as f:
+        f.write("<html><body><h1>Welcome to Domain Dominion!</h1></body></html>")
+    chunk_hashes = await client.upload_website("website.html", "example.dominion")
+    print(f"Uploaded website, chunk hashes: {chunk_hashes}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
