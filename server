@@ -1,0 +1,63 @@
+my-web-server/
+├── server.js
+├── routes/
+│   └── main.js
+├── middleware/
+│   ├── logger.js
+│   └── auth.js
+├── controllers/
+│   └── homeController.js
+└── package.json
+const http = require('http');
+const mainRouter = require('./routes/main');
+const logger = require('./middleware/logger');
+const auth = require('./middleware/auth');
+
+const server = http.createServer(async (req, res) => {
+    // Logger middleware
+    logger(req, res);
+
+    // Auth middleware (example: only allow GET requests)
+    if (!auth(req)) {
+        res.writeHead(403, {'Content-Type': 'text/plain'});
+        res.end('Forbidden');
+        return;
+    }
+
+    // Route handling
+    mainRouter(req, res);
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+module.exports = function logger(req, res) {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+};
+module.exports = function auth(req) {
+    // Example: Allow only GET requests
+    return req.method === 'GET';
+};
+const homeController = require('../controllers/homeController');
+
+module.exports = function mainRouter(req, res) {
+    if (req.url === '/' && req.method === 'GET') {
+        homeController(req, res);
+    } else {
+        res.writeHead(404, {'Content-Type': 'text/plain'});
+        res.end('Not Found');
+    }
+};
+module.exports = function homeController(req, res) {
+    res.writeHead(200, {'Content-Type': 'text/html'});
+    res.end('<h1>Welcome to Your Custom Web Server!</h1>');
+};
+{
+  "name": "my-web-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
