@@ -1,0 +1,20 @@
+[User] 
+   │
+   ▼
+[Web UI] ──► [Backend for Frontend (BFF) API]
+                    │
+                    ▼
+      ┌─────────────┬─────────────┬─────────────┬─────────────┐
+      │             │             │             │             │
+[VM Service] [Storage Service] [DB Service] [Logs Service] [Metrics Service]
+      │             │             │             │             │
+      └─────────────┴─────────────┴─────────────┴─────────────┘
+                    │
+                    ▼
+           [Event Bus / Pub-Sub]
+                    │
+                    ▼
+             [Central Database(s)]
+                    │
+                    ▼
+         [Monitoring & Health Checks]
